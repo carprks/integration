@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// Routes router
 func Routes() chi.Router {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
