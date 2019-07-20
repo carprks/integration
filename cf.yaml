@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Integration Service"
+
+Parameters:
+  ServiceName:
+    Type: String
+  Environment:
+    Type: String
+  DomainName:
+    Type: String
+  AuthorizerARN:
+    Type: String
+  Stage:
+    Type: String
+    Default: v1
+  CertificateARN:
+    Type: String
+  DNSZoneName:
+    Type: String
+  BuildBucket:
+    Type: String
+  BuildKey:
+    Type: String
+  ImageURI:
+    Type: String
+  Priority:
+    Type: Number
+    Default: 3
+  DesiredCount:
+    Type: Number
+    Default: 1
+  LoadBalancerAddress:
+    Type: String
+  LoadBalancerListenerArn:
+    Type: String
+  VPCId:
+    Type: String
+  SubnetOne:
+    Type: String
+  SubnetTwo:
+    Type: String
+  SubnetThree:
+    Type: String
+  Cluster:
+    Type: String
+    Default: carprk
+
+Resources:
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [!Ref ServiceName, authorizerrole, !Ref Environment]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:invokeFunction
+                Resource: !Ref AuthorizerARN
+
+  Authorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Join ['-', [!Ref ServiceName, authorizer, !Ref Environment]]
+      RestApiId: !Ref RestAPI
+      AuthorizerCredentials: !GetAtt AuthorizerRole.Arn
+      AuthorizerResultTtlInSeconds: 0
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerARN}/invocations
+      Type: REQUEST
+      IdentitySource: !Sub method.request.header.X-Authorization
+
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Join ['-', [!Ref ServiceName, restapi, !Ref Environment]]
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  EmptyModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      ContentType: application/json
+      Name: EmptyModel
+      RestApiId: !Ref RestAPI
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Empty
+        type: object
+
+
+  RestAPIHealthCheck:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: healthcheck
+  RestAPIHealthCheckGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref RestAPIHealthCheck
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      HttpMethod: GET
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: !Ref EmptyModel
+      Integration:
+        Type: HTTP
+        IntegrationHttpMethod: GET
+        Uri: !Join ['/', [!Ref LoadBalancerAddress, !Ref ServiceName, healthcheck]]
+        IntegrationResponses:
+          - StatusCode: 200
+
+  RestAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: RestAPIHealthCheckGet
+    Properties:
+      RestApiId: !Ref RestAPI
+
+  RestAPIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestAPI
+      StageName: !Ref Stage
+      DeploymentId: !Ref RestAPIDeployment
+
+  RestAPIDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: !Ref CertificateARN
+
+  RestAPIDomainMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      BasePath: !Ref Stage
+      DomainName: !Ref RestAPIDomainName
+      RestApiId: !Ref RestAPI
+      Stage: !Ref RestAPIStage
+
+  PrimaryRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Ref DomainName
+      Type: A
+      HostedZoneName: !Ref DNSZoneName
+      Weight: 1
+      SetIdentifier: !Join ['-', [!Ref ServiceName, recordset, !Ref Environment, !Ref 'AWS::Region']]
+      AliasTarget:
+        HostedZoneId: !GetAtt RestAPIDomainName.RegionalHostedZoneId
+        DNSName: !GetAtt RestAPIDomainName.RegionalDomainName
+        EvaluateTargetHealth: false
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [!Ref ServiceName, taskrole, !Ref Environment]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ecs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:Get*'
+                  - 's3:List*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - dax.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    iam:PassedToService:
+                      - application-autoscaling.amazonaws.com
+                      - dax.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - dax:*
+                  - application-autoscaling:*
+                  - cloudwatch:*
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - resource-groups:*
+                  - tag:GetResources"
+                Resource: '*'
+
+  ECSTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Environment:
+            - Name: AWS_DB_REGION
+              Value: !Ref AWS::Region
+            - Name: PORT
+              Value: 80
+            - Name: SERVICE_NAME
+              Value: !Ref ServiceName
+            - Name: SITE_PREFIX
+              Value: !Join ['', ['/', !Ref ServiceName]]
+            - Name: SERVICE_DEPENDENCIES
+              Value: '{"dependencies":[]}'
+          Essential: true
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl --silent --fail localhost/probe || exit 1
+            Interval: 60
+            Retries: 10
+            StartPeriod: 60
+            Timeout: 10
+          Image: !Ref ImageURI
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudwatchLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: 'ecs'
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+          Name: !Ref ServiceName
+      Cpu: 256
+      ExecutionRoleArn: !GetAtt TaskRole.Arn
+      Family: !Ref ServiceName
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  CloudwatchLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['/', ['/ecs', !Ref ServiceName]]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /probe
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 4
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: !Join ['-', [!Ref ServiceName, targetgroup, !Ref Environment]]
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPCId
+
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Sub "/${ServiceName}*"
+      ListenerArn: !Ref LoadBalancerListenerArn
+      Priority: !Ref Priority
+
+  SecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [!Ref ServiceName, securitygroup, !Ref Environment]]
+      GroupName: !Join ['-', [!Ref ServiceName, securitygroup, !Ref Environment]]
+      SecurityGroupEgress:
+        - CidrIp: '0.0.0.0/0'
+          IpProtocol: -1
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+      VpcId: !Ref VPCId
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerRule
+    Properties:
+      Cluster: !Ref Cluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 5
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SecGroup
+          Subnets:
+            - !Ref SubnetOne
+            - !Ref SubnetTwo
+            - !Ref SubnetThree
+      TaskDefinition: !Ref ECSTask
